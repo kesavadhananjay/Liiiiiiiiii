@@ -19,6 +19,10 @@ SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID", "")
 # Folder inside shared drive where raw HTML files are uploaded
 DRIVE_HTML_FOLDER_ID = os.environ.get("DRIVE_HTML_FOLDER_ID", "")
 JSONL_OUTPUT         = os.environ.get("JSONL_OUTPUT", "linkedin_output.jsonl")
+# OAuth user credentials (for normal folder uploads)
+OAUTH_REFRESH_TOKEN = os.environ.get("OAUTH_REFRESH_TOKEN", "")
+OAUTH_CLIENT_ID     = os.environ.get("OAUTH_CLIENT_ID", "")
+OAUTH_CLIENT_SECRET = os.environ.get("OAUTH_CLIENT_SECRET", "")
 
 SERVICE_ACCOUNT_FILE = os.environ.get("GOOGLE_SERVICE_ACCOUNT_FILE", "")
 
@@ -36,8 +40,11 @@ def _load_service_account_json() -> Optional[str]:
 SERVICE_ACCOUNT_JSON = _load_service_account_json()
 WORKSHEET_NAME = os.environ.get("WORKSHEET_NAME", "DataBase")
 
+# ponytail: browser UAs get HTTP 999 from LinkedIn; the crawler UA is served the full
+# logged-out page (verified 100/100 on urls.txt, 0 blocks). If they ever start verifying
+# crawler IPs by reverse-DNS, this stops working -> then you need residential proxies.
 HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.75 Safari/537.36',
+    'User-Agent': 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)',
     'Accept-Language': 'en-US,en;q=0.9',
     'Accept-Encoding': 'gzip, deflate, br',
 }
@@ -47,6 +54,7 @@ MAX_WORKERS        = 6
 BATCH_UPDATE_SIZE  = 40
 CHUNK_SIZE         = 400
 POLL_INTERVAL      = 60
+ERROR_RETRY_THRESHOLD = 10
 
 # Column layout
 # Column layout matching social-media-internal schema (A=1 ... AI=35)
@@ -89,23 +97,41 @@ _creds: Optional[Credentials] = None
 
 def get_creds() -> Credentials:
     global _creds
-    if _creds is None:
-        scopes = [
-            'https://www.googleapis.com/auth/spreadsheets',
-            'https://www.googleapis.com/auth/drive',
-        ]
-        if SERVICE_ACCOUNT_JSON:
-            try:
-                info = json.loads(SERVICE_ACCOUNT_JSON)
-            except json.JSONDecodeError as e:
-                raise RuntimeError(f"Service account env var is invalid JSON: {e}")
-            _creds = Credentials.from_service_account_info(info, scopes=scopes)
-        elif os.path.exists(SERVICE_ACCOUNT_FILE):
-            _creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=scopes)
-        else:
-            raise RuntimeError(
-                "No credentials available. Set GOOGLE_SERVICE_ACCOUNT_JSON env var."
-            )
+    if _creds and _creds.valid:
+        return _creds
+
+    scopes = [
+        'https://www.googleapis.com/auth/spreadsheets',
+        'https://www.googleapis.com/auth/drive',
+    ]
+
+    # Use OAuth user token if provided (needed for normal folder uploads — a service
+    # account has no Drive storage quota of its own, so uploads to a plain "My Drive"
+    # folder fail; only shared drives work for it).
+    if OAUTH_REFRESH_TOKEN and OAUTH_CLIENT_ID and OAUTH_CLIENT_SECRET:
+        from google.oauth2.credentials import Credentials as OAuthCredentials
+        _creds = OAuthCredentials(
+            token=None,
+            refresh_token=OAUTH_REFRESH_TOKEN,
+            client_id=OAUTH_CLIENT_ID,
+            client_secret=OAUTH_CLIENT_SECRET,
+            token_uri='https://oauth2.googleapis.com/token',
+        )
+        _creds.refresh(Request())
+        return _creds
+
+    # Fallback: service account (for shared drives)
+    if SERVICE_ACCOUNT_JSON:
+        try:
+            info = json.loads(SERVICE_ACCOUNT_JSON)
+        except json.JSONDecodeError as e:
+            raise RuntimeError(f"Service account env var is invalid JSON: {e}")
+        _creds = Credentials.from_service_account_info(info, scopes=scopes)
+    elif os.path.exists(SERVICE_ACCOUNT_FILE):
+        _creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=scopes)
+    else:
+        raise RuntimeError("No credentials available.")
+
     if not _creds.valid:
         _creds.refresh(Request())
     return _creds
@@ -572,6 +598,11 @@ def fetch_linkedin(url: str) -> Tuple[Optional[Dict[str, Any]], str, str]:
     for suf in ['/about', '/people', '/jobs', '/posts', '/insights']:
         if clean_url.endswith(suf):
             clean_url = clean_url[:-len(suf)]
+    # Normalise to https://www. — sheet URLs arrive scheme-less ("linkedin.com/company/x"),
+    # and bare linkedin.com serves a reCAPTCHA interstitial at HTTP 200. Locale subdomains
+    # (fi./de./…) are folded to www so the English field labels the parser expects show up.
+    clean_url = re.sub(r'^(?:https?://)?(?:[a-z]{2,3}\.)?linkedin\.com',
+                       'https://www.linkedin.com', clean_url, flags=re.I)
     try:
         r = requests.get(clean_url, headers=HEADERS, timeout=20, allow_redirects=True)
     except Exception as e:
@@ -588,6 +619,11 @@ def fetch_linkedin(url: str) -> Tuple[Optional[Dict[str, Any]], str, str]:
     og_title_m = re.search(r'<meta\s+property="og:title"\s+content="([^"]*)"', r.text)
     if og_title_m and og_title_m.group(1).startswith('LinkedIn Login'):
         return None, '', "blocked_login"
+    # bot challenge served at 200 with no redirect - must not be recorded as a clean miss.
+    # Match the challenge page's <title> only: real pages carry a recaptcha-v3 attribute
+    # in <head>, so a loose substring match false-positives on every good page.
+    if re.search(r'<title>\s*Checking your browser', r.text[:5000], re.IGNORECASE):
+        return None, '', "blocked_captcha"
 
     fields = extract_fields(r.text, clean_url)
     return fields, r.text, ''
@@ -656,10 +692,56 @@ def fetch_open_chunk(ws, limit: int) -> List[Tuple[int, str, str]]:
     return open_rows
 
 
+def reopen_error_tickets(ws, threshold: int = ERROR_RETRY_THRESHOLD) -> int:
+    """Find all rows with status == 'error' and note != 'no_core_fields'.
+    If the count is >= threshold, reset their ticket (Col C) to 'open'.
+    Returns the number of rows reopened (or 0 if below threshold).
+    """
+    rows = ws.get('A2:AI')
+    candidate_indices: List[int] = []
+    for i, r in enumerate(rows, start=2):
+        pad = r + [''] * (35 - len(r))
+        domain = pad[0].strip()
+        url = pad[1].strip()
+        status = pad[3].strip().lower()
+        note = pad[COL_NOTE - 1].strip().lower()
+
+        if domain and url and status == 'error' and note != 'no_core_fields':
+            candidate_indices.append(i)
+
+    count = len(candidate_indices)
+    if count >= threshold:
+        print(f"Found {count} non-'no_core_fields' error rows (>= threshold {threshold}). Reopening tickets...", flush=True)
+        cells = [gspread.Cell(idx, 3, 'open') for idx in candidate_indices]
+        for attempt in range(5):
+            try:
+                ws.update_cells(cells)
+                break
+            except gspread.exceptions.APIError as e:
+                if '429' in str(e) or 'Quota' in str(e):
+                    time.sleep(30 * (attempt + 1))
+                else:
+                    raise
+        print(f"Successfully reopened {count} error rows to 'open'.", flush=True)
+        return count
+    else:
+        print(f"Non-'no_core_fields' error count is {count} (< threshold {threshold}). No tickets reopened.", flush=True)
+        return 0
+
+
 def run_pipeline():
     print(f"Connecting to worksheet '{WORKSHEET_NAME}'...", flush=True)
     ws = open_sheet()
     open_rows = fetch_open_chunk(ws, CHUNK_SIZE)
+    if not open_rows:
+        print("No open tickets found. Checking for retryable error tickets...", flush=True)
+        reopened = reopen_error_tickets(ws, ERROR_RETRY_THRESHOLD)
+        if reopened > 0:
+            open_rows = fetch_open_chunk(ws, CHUNK_SIZE)
+        else:
+            print("No tickets to process this cycle.", flush=True)
+            return
+
     print(f"Open tickets this cycle: {len(open_rows)}", flush=True)
     if not open_rows:
         return
