@@ -706,12 +706,12 @@ def reopen_error_tickets(ws, threshold: int = ERROR_RETRY_THRESHOLD) -> int:
         status = pad[3].strip().lower()
         note = pad[COL_NOTE - 1].strip().lower()
 
-        if domain and url and status == 'error' and note != 'no_core_fields':
+        if domain and url and status == 'error' and note not in ('no_core_fields', 'not_found'):
             candidate_indices.append(i)
 
     count = len(candidate_indices)
     if count >= threshold:
-        print(f"Found {count} non-'no_core_fields' error rows (>= threshold {threshold}). Reopening tickets...", flush=True)
+        print(f"Found {count} eligible error rows (>= threshold {threshold}). Reopening tickets...", flush=True)
         cells = [gspread.Cell(idx, 3, 'open') for idx in candidate_indices]
         for attempt in range(5):
             try:
@@ -725,7 +725,7 @@ def reopen_error_tickets(ws, threshold: int = ERROR_RETRY_THRESHOLD) -> int:
         print(f"Successfully reopened {count} error rows to 'open'.", flush=True)
         return count
     else:
-        print(f"Non-'no_core_fields' error count is {count} (< threshold {threshold}). No tickets reopened.", flush=True)
+        print(f"Eligible error count is {count} (< threshold {threshold}). No tickets reopened.", flush=True)
         return 0
 
 
